@@ -1,0 +1,1 @@
+void ndscart_begin();
