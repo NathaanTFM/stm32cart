@@ -66,15 +66,22 @@ This is very slow: the function would have to return and cleanup everything when
 
 To increase performance, I've written another interrupt handler that immediately gives up on the current executing function and resumes in another function. Basically, it just calls longjmp. This allows me to write "while true" loops. Everything is cleaned up when CS1/CS2 goes low.
 
-# Benchmark
+## Benchmark
 
 Main data transfer: using GAP=12h, can do 750 consecutive reads with 1000h bytes length, or 6000 consecutive reads with 200h bytes.
 
 Will need more benchmarking.
 
-# To-do
+## To-do
 
 - An actual flashcart with ROM patching and microSD card reading
 - SPI NAND chip support 
 - RP2040 version
 - Code cleanup
+- DSi support (ARM9i secure area, command 3Dh)
+
+## Regarding SPI
+
+The cart can currently serve a non-volatile, hard-coded save file through SPI (Chip select 2, backup ROM, idk how you people call it). However, it probably won't be possible to write to that save.
+
+If you want to make a "repro card" for some reason (this isn't the goal of that project), it'd be easier to include an actual EEPROM depending on the game you're running. Make sure to unset ENABLE_SPI first. You'd also probably need to add a new DMA channel to set GPIOA P0-7 to input mode on CS1 low (to prevent interfering with an actual second chip).
