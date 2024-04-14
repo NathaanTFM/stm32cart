@@ -42,7 +42,7 @@ Transfer is handled by DMA:
 - DMA1 Channel2: writes the data from the transferBuffer to I/O pins when CLK gets high
 - DMA1 Channel3: switches GPIO to input mode after the last command byte
 - DMA1 Channel4: enables the first two DMA channels on CS1 low
-- DMA1 Channel5: if SPI is enabled, enables SPI2. Otherwise, stops the first two DMA1 channels on CS1 high.
+- DMA1 Channel5: if SPI is enabled, enables SPI2 on CS2 low. Otherwise, stops the first two DMA1 channels on CS1 high.
 
 DMA2 is used for SPI communication with the W25Q memory chip.
 
