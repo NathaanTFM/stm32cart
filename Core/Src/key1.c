@@ -1,16 +1,23 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 #include "key1.h"
-#include "key1buf.h"
+#include "blowfish_table.h"
 
 #define bswap_32bit(x) __builtin_bswap32(x)
 
 #define NO_INIT __attribute__ ((section(".noinit")))
+
 static NO_INIT uint32_t keycode[3];
-//uint32_t __attribute__((section(".keybuf"))) keybuf[0x412];
-const uint32_t *const keybuf = (const uint32_t *)KEYBUF_ADDR;
+__attribute__((aligned(FLASH_PAGE_SIZE))) const uint32_t keybuf_nds[KEYBUF_SIZE / 4];
+__attribute__((aligned(FLASH_PAGE_SIZE))) const uint32_t keybuf_dsi[KEYBUF_SIZE / 4];
+
+static_assert((sizeof(keybuf_nds) & (FLASH_PAGE_SIZE-1)) == 0);
+static_assert((sizeof(keybuf_dsi) & (FLASH_PAGE_SIZE-1)) == 0);
+
+// Read-only in most cases
 uint32_t *keybuf_ptr;
 
 static inline void encrypt_64bit(uint32_t* b0, uint32_t* b1) {
@@ -36,17 +43,17 @@ static inline void decrypt_64bit(uint32_t* b0, uint32_t* b1) {
     uint32_t x = *b1;
 
     for (int i = 0x11; i > 0x01; i--) {
-        uint32_t z = keybuf[i] ^ x;
-        x = keybuf[0x12 + ((z >> 24) & 0xFF)];
-        x += keybuf[0x112 + ((z >> 16) & 0xFF)];
-        x ^= keybuf[0x212 + ((z >> 8) & 0xFF)];
-        x += keybuf[0x312 + (z & 0xFF)];
+        uint32_t z = keybuf_ptr[i] ^ x;
+        x = keybuf_ptr[0x12 + ((z >> 24) & 0xFF)];
+        x += keybuf_ptr[0x112 + ((z >> 16) & 0xFF)];
+        x ^= keybuf_ptr[0x212 + ((z >> 8) & 0xFF)];
+        x += keybuf_ptr[0x312 + (z & 0xFF)];
         x ^= y;
         y = z;
     }
 
-    *b0 = x ^ keybuf[0x01];
-    *b1 = y ^ keybuf[0x00];
+    *b0 = x ^ keybuf_ptr[0x01];
+    *b1 = y ^ keybuf_ptr[0x00];
 }
 
 static void apply_keycode() {
@@ -65,8 +72,8 @@ static void apply_keycode() {
     }
 }
 
-void key1_init(uint32_t idcode) {
-	memcpy(keybuf_ptr, ninkeybuf, 0x412 * sizeof(uint32_t));
+void key1_init(uint32_t idcode, const uint32_t *key) {
+	memcpy(keybuf_ptr, key, 0x412 * sizeof(uint32_t));
 
     keycode[0] = idcode;
     keycode[1] = idcode / 2;

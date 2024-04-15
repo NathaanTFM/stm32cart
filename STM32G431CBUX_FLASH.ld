@@ -41,15 +41,15 @@ _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
 _Min_Heap_Size = 0x200; /* required amount of heap */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
+_Config_Size = 0x12000;
 _No_Init_Size = 0x7900;
 
 /* Memories definition */
 MEMORY
 {
-  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 32K - _No_Init_Size
-  NOINIT (rw) : ORIGIN = 0x20000000 + 32K - _No_Init_Size, LENGTH = _No_Init_Size
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 128K - 8K
-  KEYBUF (r) : ORIGIN = 0x8000000 + 128K - 8K, LENGTH = 8K
+  RAM        (xrw) : ORIGIN = 0x20000000,                            LENGTH = 32K - _No_Init_Size
+  NOINIT     (rw)  : ORIGIN = 0x20000000 + 32K - _No_Init_Size,      LENGTH = _No_Init_Size
+  FLASH      (rx)  : ORIGIN = 0x8000000,                             LENGTH = 128K
 }
 
 /* Sections */
@@ -88,12 +88,6 @@ SECTIONS
     *(.rodata*)        /* .rodata* sections (constants, strings, etc.) */
     . = ALIGN(4);
   } >FLASH
-  
-  /* KEY1 buffer has its own pages */
-  .keybuf :
-  {
-    KEEP (*(.keybuf))
-  } >KEYBUF
 
   .ARM.extab   : {
     . = ALIGN(4);

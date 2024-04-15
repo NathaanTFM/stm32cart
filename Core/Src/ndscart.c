@@ -1,11 +1,13 @@
 #include "main.h"
 #include "key1.h"
+#include "config.h"
+#include "blowfish_table.h"
 
 #include <string.h>
 #include <stdio.h>
 #include <setjmp.h>
 
-#include <stm32g4xx_ll_bus.h>
+#include <stm32g4xx_hal.h>
 
 // define this for WIP 1000h bytes transfer support
 #define TRANSFER_1000H
@@ -27,8 +29,6 @@ void *stackPointer;
 
 // transfer buffer backup
 static volatile uint16_t currentState = 0;
-
-static ALIGN(4) const uint8_t chipId[4] = {0xAB, 0xCD, 0xEF, 0x00};
 
 #define DATA_SPI1 (*(volatile uint8_t *)&SPI1->DR)
 #define DATA_OUT (*(volatile uint8_t *)&GPIOA->ODR)
@@ -104,19 +104,9 @@ static ALIGN(4) NO_INIT volatile uint8_t spiBuffer[0x40];
 #define IS_SPI_AVAILABLE(sz, nb) (SPI_AVAILABLE(sz) > nb)
 #define SPI_WAIT(sz, nb) while (!IS_SPI_AVAILABLE(sz, nb)); // wait for index to be available
 
-// Those were inside jokes with friends. Please forget about them. I'm keeping them because I don't want to rebuild my 3DS homebrew
-static const uint8_t flash_modecmd[8] = {'A','M','O','G','U','S',0,0};
-static const uint8_t flash_flashcmd[8] = {'C','R','A','M','P','T','E','S'};
-static const uint8_t flash_erasecmd[8] = {'A','P','A','G','N','A','N','!'};
-static const uint8_t flash_pollcmd[8] = {'Q','C','O','U','B','E','H','?'};
-static const uint8_t flash_debugcmd[8] = {'B','E','B','O','U','?','?','?'};
-
 #ifdef ENABLE_SPI2
 static volatile uint32_t spi2cr[2];
 static volatile uint32_t gpiof_moder;
-
-const uint8_t save[0x8000];
-
 #endif
 
 /* KEY 2 */
@@ -173,17 +163,6 @@ static void memcpy_v(volatile void *dest, volatile const void *src, size_t n) {
     volatile char *dest_c = dest;
     for (size_t i = 0; i < n; i++)
         dest_c[i] = src_c[i];
-}
-
-static int memcmp_v(volatile const void *buf1, volatile const void *buf2, size_t n) {
-	volatile const char *buf1_c = buf1;
-	volatile const char *buf2_c = buf2;
-
-	for (size_t i = 0; i < n; i++) {
-		if (buf1_c[i] != buf2_c[i])
-			return 1; // maybe the opposite, i don't care!
-	}
-	return 0;
 }
 
 static inline void spiSelect() {
@@ -461,6 +440,17 @@ static void spiEraseSector(uint32_t address) {
 	spiWriteDisable();
 }
 
+static void spiEraseChip() {
+	while (spiReadStatus() & 1) delay(5000);
+	spiWriteEnable();
+
+	uint8_t cmd[1] = {0xC7};
+	spiCommand(cmd, 1, NULL, 0);
+
+	while (spiReadStatus() & 1) delay(5000);
+	spiWriteDisable();
+}
+
 #ifdef ENABLE_SPI2
 
 static inline void spi2Init() {
@@ -537,23 +527,27 @@ static inline void dmamuxInit() {
 	);
 
 #ifdef ENABLE_SPI2
-	// request generator 3: low cs2
-	DMAMUX1_RequestGenerator3->RGCR = (
-		  (1  << DMAMUX_RGxCR_GNBREQ_Pos) // GNBREQ-1 (generate 2 transfers)
-		| (2  << DMAMUX_RGxCR_GPOL_Pos) // falling edge
-		| (1  << DMAMUX_RGxCR_GE_Pos) // enable generator
-		| (0  << DMAMUX_RGxCR_OIE_Pos) // disable overrun event
-		| (15 << DMAMUX_RGxCR_SIG_ID_Pos) // EXTI15 (CS2)
-	);
-#else
-	// request generator 3: high cs1, 2 transfers
-	DMAMUX1_RequestGenerator3->RGCR = (
-		  (1  << DMAMUX_RGxCR_GNBREQ_Pos) // GNBREQ-1 (generate 2 transfers)
-		| (1  << DMAMUX_RGxCR_GPOL_Pos) // rising edge
-		| (0  << DMAMUX_RGxCR_GE_Pos) // enable generator
-		| (0  << DMAMUX_RGxCR_OIE_Pos) // disable overrun event
-		| (14 << DMAMUX_RGxCR_SIG_ID_Pos) // EXTI14 (CS1)
-	);
+	if (config.spi_variant != 0) {
+		// request generator 3: low cs2
+		DMAMUX1_RequestGenerator3->RGCR = (
+			  (1  << DMAMUX_RGxCR_GNBREQ_Pos) // GNBREQ-1 (generate 2 transfers)
+			| (2  << DMAMUX_RGxCR_GPOL_Pos) // falling edge
+			| (1  << DMAMUX_RGxCR_GE_Pos) // enable generator
+			| (0  << DMAMUX_RGxCR_OIE_Pos) // disable overrun event
+			| (15 << DMAMUX_RGxCR_SIG_ID_Pos) // EXTI15 (CS2)
+		);
+	} else {
+#endif
+		// request generator 3: high cs1, 2 transfers
+		DMAMUX1_RequestGenerator3->RGCR = (
+			  (1  << DMAMUX_RGxCR_GNBREQ_Pos) // GNBREQ-1 (generate 2 transfers)
+			| (1  << DMAMUX_RGxCR_GPOL_Pos) // rising edge
+			| (0  << DMAMUX_RGxCR_GE_Pos) // enable generator
+			| (0  << DMAMUX_RGxCR_OIE_Pos) // disable overrun event
+			| (14 << DMAMUX_RGxCR_SIG_ID_Pos) // EXTI14 (CS1)
+		);
+#ifdef ENABLE_SPI2
+	}
 #endif
 
 	// Fill the dmamuxGeneratorEnable buffer
@@ -664,57 +658,60 @@ static inline void dmaInit() {
 	DMA1_Channel4->CNDTR = sizeof(dmamuxGeneratorEnable) / sizeof(uint32_t);
 
 #ifdef ENABLE_SPI2
-	// CS transfer (CS2 variant)
-	// The point here is to start the SPI channel transfer as soon as chip is selected
-	DMA1_Channel5->CCR = (
-		  (0 << DMA_CCR_MEM2MEM_Pos) // disable memory-to-memory
-		| (1 << DMA_CCR_PL_Pos) // normal priority
-		| (2 << DMA_CCR_MSIZE_Pos) // 32 bits in memory
-		| (2 << DMA_CCR_PSIZE_Pos) // 32 bits in peripheral (DMA)
-		| (1 << DMA_CCR_MINC_Pos) // increment memory
-		| (1 << DMA_CCR_PINC_Pos) // increment peripheral
-		| (1 << DMA_CCR_CIRC_Pos) // circular mode
-		| (1 << DMA_CCR_DIR_Pos) // read from memory
-		| (0 << DMA_CCR_TEIE_Pos) // disable transfer error interrupt
-		| (0 << DMA_CCR_HTIE_Pos) // disable half transfer interrupt
-		| (0 << DMA_CCR_TCIE_Pos) // disable transfer complete interrupt
-		| (0 << DMA_CCR_EN_Pos) // do not enable channel yet
-	);
+	if (config.spi_variant != 0) {
+		// CS transfer (CS2 variant)
+		// The point here is to start the SPI channel transfer as soon as chip is selected
+		DMA1_Channel5->CCR = (
+			  (0 << DMA_CCR_MEM2MEM_Pos) // disable memory-to-memory
+			| (1 << DMA_CCR_PL_Pos) // normal priority
+			| (2 << DMA_CCR_MSIZE_Pos) // 32 bits in memory
+			| (2 << DMA_CCR_PSIZE_Pos) // 32 bits in peripheral (DMA)
+			| (1 << DMA_CCR_MINC_Pos) // increment memory
+			| (1 << DMA_CCR_PINC_Pos) // increment peripheral
+			| (1 << DMA_CCR_CIRC_Pos) // circular mode
+			| (1 << DMA_CCR_DIR_Pos) // read from memory
+			| (0 << DMA_CCR_TEIE_Pos) // disable transfer error interrupt
+			| (0 << DMA_CCR_HTIE_Pos) // disable half transfer interrupt
+			| (0 << DMA_CCR_TCIE_Pos) // disable transfer complete interrupt
+			| (0 << DMA_CCR_EN_Pos) // do not enable channel yet
+		);
 
-	DMAMUX1_Channel4->CCR = (
-		(4 << DMAMUX_CxCR_DMAREQ_ID_Pos) // Request Generator 3
-	);
+		DMAMUX1_Channel4->CCR = (
+			(4 << DMAMUX_CxCR_DMAREQ_ID_Pos) // Request Generator 3
+		);
 
-	DMA1_Channel5->CPAR = (uint32_t)&SPI2->CR1;
-	DMA1_Channel5->CMAR = (uint32_t)spi2cr;
-	DMA1_Channel5->CNDTR = sizeof(spi2cr) / sizeof(uint32_t);
+		DMA1_Channel5->CPAR = (uint32_t)&SPI2->CR1;
+		DMA1_Channel5->CMAR = (uint32_t)spi2cr;
+		DMA1_Channel5->CNDTR = sizeof(spi2cr) / sizeof(uint32_t);
 
-	// CS2 transfer
+	} else {
+#endif
+		// CS transfer for disabling
+		DMA1_Channel5->CCR = (
+			  (0 << DMA_CCR_MEM2MEM_Pos) // disable memory-to-memory
+			| (1 << DMA_CCR_PL_Pos) // normal priority
+			| (2 << DMA_CCR_MSIZE_Pos) // 32 bits in memory
+			| (2 << DMA_CCR_PSIZE_Pos) // 32 bits in peripheral (DMA)
+			| (1 << DMA_CCR_MINC_Pos) // increment memory
+			| (1 << DMA_CCR_PINC_Pos) // increment peripheral
+			| (1 << DMA_CCR_CIRC_Pos) // circular mode
+			| (1 << DMA_CCR_DIR_Pos) // read from peripheral
+			| (0 << DMA_CCR_TEIE_Pos) // disable transfer error interrupt
+			| (0 << DMA_CCR_HTIE_Pos) // disable half transfer interrupt
+			| (0 << DMA_CCR_TCIE_Pos) // disable transfer complete interrupt
+			| (0 << DMA_CCR_EN_Pos) // do not enable channel yet
+		);
 
-#else
-	// CS transfer for disabling
-	DMA1_Channel5->CCR = (
-		  (0 << DMA_CCR_MEM2MEM_Pos) // disable memory-to-memory
-		| (1 << DMA_CCR_PL_Pos) // normal priority
-		| (2 << DMA_CCR_MSIZE_Pos) // 32 bits in memory
-		| (2 << DMA_CCR_PSIZE_Pos) // 32 bits in peripheral (DMA)
-		| (1 << DMA_CCR_MINC_Pos) // increment memory
-		| (1 << DMA_CCR_PINC_Pos) // increment peripheral
-		| (1 << DMA_CCR_CIRC_Pos) // circular mode
-		| (1 << DMA_CCR_DIR_Pos) // read from peripheral
-		| (0 << DMA_CCR_TEIE_Pos) // disable transfer error interrupt
-		| (0 << DMA_CCR_HTIE_Pos) // disable half transfer interrupt
-		| (0 << DMA_CCR_TCIE_Pos) // disable transfer complete interrupt
-		| (0 << DMA_CCR_EN_Pos) // do not enable channel yet
-	);
+		DMAMUX1_Channel4->CCR = (
+			(4 << DMAMUX_CxCR_DMAREQ_ID_Pos) // Request Generator 3
+		);
 
-	DMAMUX1_Channel4->CCR = (
-		(4 << DMAMUX_CxCR_DMAREQ_ID_Pos) // Request Generator 3
-	);
+		DMA1_Channel5->CPAR = (uint32_t)&DMAMUX1_RequestGenerator0->RGCR;
+		DMA1_Channel5->CMAR = (uint32_t)dmamuxGeneratorDisable;
+		DMA1_Channel5->CNDTR = sizeof(dmamuxGeneratorDisable) / sizeof(uint32_t);
 
-	DMA1_Channel5->CPAR = (uint32_t)&DMAMUX1_RequestGenerator0->RGCR;
-	DMA1_Channel5->CMAR = (uint32_t)dmamuxGeneratorDisable;
-	DMA1_Channel5->CNDTR = sizeof(dmamuxGeneratorDisable) / sizeof(uint32_t);
+#ifdef ENABLE_SPI2
+	}
 #endif
 }
 
@@ -964,13 +961,13 @@ static inline void handle_command() {
 	}
 
 	case 0x90: {
-		DATA_OUT = transferBuffer[0] = chipId[0];
-		transferBuffer[1] = chipId[1];
-		transferBuffer[2] = chipId[2];
-		transferBuffer[3] = chipId[3];
+		DATA_OUT = transferBuffer[0] = config.chip_id[0];
+		transferBuffer[1] = config.chip_id[1];
+		transferBuffer[2] = config.chip_id[2];
+		transferBuffer[3] = config.chip_id[3];
 
 		for (int i = 4; i < 0x200; i += 4) {
-			*(volatile uint32_t *)&transferBuffer[i] = *(uint32_t *)chipId;
+			*(volatile uint32_t *)&transferBuffer[i] = *(uint32_t *)config.chip_id;
 		}
 		break;
 	}
@@ -984,12 +981,20 @@ static inline void handle_command() {
 	case 0x3C: {
 		// enable KEY1
 		currentState = 3;
+		keybuf_ptr = (uint32_t *)keybuf_nds;
 		break;
 	}
 
-	case 'A': {
+	case 0x3D: {
+		// enable KEY1 (dsi)
+		currentState = 3;
+		keybuf_ptr = (uint32_t *)keybuf_dsi;
+		break;
+	}
+
+	case 'F': {
 		WAIT_FOR_BYTE(4);
-		if (memcmp_v(command, flash_modecmd, 4) == 0) {
+		if (command[1] == 'L' && command[2] == 'A' && command[3] == 'S' && command[4] == 'H') {
 			// switch to flash mode
 			currentState = 7;
 			break;
@@ -1025,7 +1030,7 @@ static inline void handle_key1() {
 			*(volatile uint32_t *)&transferBuffer[0x904] = __builtin_bswap32(seedPosition);
 
 			while (pos < (0x910+0x200)) {
-				*(volatile uint32_t *)&transferBuffer[pos] = *(uint32_t *)chipId ^ KEY2_AT_32(pos);
+				*(volatile uint32_t *)&transferBuffer[pos] = *(uint32_t *)config.chip_id ^ KEY2_AT_32(pos);
 				pos += 4;
 			}
 
@@ -1179,10 +1184,10 @@ static inline void handle_key2() {
 
 	}
 	case 0xB8: {
-		DATA_OUT = transferBuffer[0] = chipId[0] ^ KEY2_AT(8);
-		transferBuffer[1] = chipId[1] ^ KEY2_AT(9);
-		transferBuffer[2] = chipId[2] ^ KEY2_AT(10);
-		transferBuffer[3] = chipId[3] ^ KEY2_AT(11);
+		DATA_OUT = transferBuffer[0] = config.chip_id[0] ^ KEY2_AT(8);
+		transferBuffer[1] = config.chip_id[1] ^ KEY2_AT(9);
+		transferBuffer[2] = config.chip_id[2] ^ KEY2_AT(10);
+		transferBuffer[3] = config.chip_id[3] ^ KEY2_AT(11);
 
 		// Writing more means it gets interrupted by chip unselect and then chip select,
 		// which gives us less time to handle the next command.
@@ -1198,109 +1203,207 @@ static inline void handle_key2() {
 }
 
 
-static void start_ignoring() {
-	__disable_irq();
-
-	DMA1_Channel1->CCR &= ~DMA_CCR_EN;
-	DMA1_Channel2->CCR &= ~DMA_CCR_EN;
-	DMA1_Channel3->CCR &= ~DMA_CCR_EN;
-	DMA1_Channel4->CCR &= ~DMA_CCR_EN;
-	DMA1_Channel5->CCR &= ~DMA_CCR_EN;
-
-	*(volatile uint16_t *)&GPIOA->MODER = 0x5555;
-	DATA_OUT = 0xCC;
+/** Disables input DMA channels */
+static void disable_dma_input() {
+	// Disable every DMA channel
+	DMA1_Channel1->CCR &= ~DMA_CCR_EN; // Disable DMA for transfer input
+	DMA1_Channel2->CCR &= ~DMA_CCR_EN; // Disable DMA for transfer output
+	DMA1_Channel3->CCR &= ~DMA_CCR_EN; // Disable DMA for gpio mode
+	DMA1_Channel4->CCR &= ~DMA_CCR_EN; // Disable DMA for CS1 low
+	DMA1_Channel5->CCR &= ~DMA_CCR_EN; // Disable DMA for CS1 high (or CS2 low)
 }
 
-static void stop_ignoring() {
-	*(volatile uint16_t *)&GPIOA->MODER = 0;
-
-	// restart dma channel 4
-	DMA1_Channel4->CCR |= DMA_CCR_EN;
-	DMA1_Channel5->CCR |= DMA_CCR_EN;
-
-	// restore irq (might never return)
-	while (!(GPIOA->IDR & CS1_Pin)); // while it's selected
-	__enable_irq();
+static void enable_dma_input() {
+	// Re-enable DMA channels
+	DMA1_Channel1->CCR |= DMA_CCR_EN; // Enable DMA for transfer input
+	DMA1_Channel2->CCR |= DMA_CCR_EN; // Enable DMA for transfer output
+	DMA1_Channel3->CCR |= DMA_CCR_EN; // Enable DMA for gpio mode
+	DMA1_Channel4->CCR |= DMA_CCR_EN; // Enable DMA for CS1 low
+	DMA1_Channel5->CCR |= DMA_CCR_EN; // Enable DMA for CS1 high (or CS2 low)
+	//__enable_irq();
 }
 
-static void preinit_flash() {
+static void flash_keybuf(const uint32_t *keybuf, uint8_t *data, int special) {
+	uint32_t address = (uint32_t)keybuf;
+
+	FLASH_EraseInitTypeDef erase;
+	erase.TypeErase = FLASH_TYPEERASE_PAGES;
+	erase.Banks = FLASH_BANK_1; // i have a single bank
+	erase.Page = (address - FLASH_BASE) / FLASH_PAGE_SIZE; // erase our page
+	erase.NbPages = KEYBUF_SIZE / FLASH_PAGE_SIZE; // (erase 8 KB)
+	uint32_t pageerror;
+
+	HAL_FLASH_Unlock();
+	HAL_FLASHEx_Erase(&erase, &pageerror);
+
+	int j = 0;
+	for (int i = 0; i < 0x1048; i += 8) {
+		if (special && j != 0 && (j & 0x1FF) == 0) {
+			j += 8;
+		}
+		HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, address + i, *(uint64_t *)&data[j]);
+		j += 8;
+		// TODO: proper error handling
+	}
+
+	HAL_FLASH_Lock();
+}
+
+static void flash_config(uint32_t offset, uint8_t *data, int special) {
+	uint32_t addr = (uint32_t)&config + 0x1000 * offset;
+
+	if (addr >= (uint32_t)&config && addr < ((uint32_t)&config + sizeof(config))) {
+		FLASH_EraseInitTypeDef erase;
+		erase.TypeErase = FLASH_TYPEERASE_PAGES;
+		erase.Banks = FLASH_BANK_1; // i have a single bank
+		erase.Page = (addr - FLASH_BASE) / FLASH_PAGE_SIZE; // erase our page
+		erase.NbPages = CONFIG_SIZE / FLASH_PAGE_SIZE; // (erases 4 KB)
+		uint32_t pageerror;
+
+		HAL_FLASH_Unlock();
+		HAL_FLASHEx_Erase(&erase, &pageerror);
+
+		int j = 0;
+		for (int i = 0; i < 0x1000; i += 8) {
+			if (special && j != 0 && (j & 0x1FF) == 0) {
+				j += 8;
+			}
+			HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr + i, *(uint64_t *)&data[j]);
+			j += 8;
+			// TODO: proper error handling
+		}
+
+		HAL_FLASH_Lock();
+	}
+}
+
+static void preinit_flash(int32_t transferred) {
 	gpioModeBuffer[7] = 0x5555;
+
+	// N.B: there's a tiny amount of time between chip unselect and this function
+	// where transfers are allowed (and shouldn't be).
+	// The timing is very tight so it shouldn't cause any issue, but leaving that here
+	// so I might fix that later
+
+	if (transferred >= 8) {
+		// We have a upcoming flash operation going on, maybe
+		// Right now we have our IRQ disabled; but we wanna make sure our transferBuffer doesn't get destroyed
+		disable_dma_input();
+
+		switch (command[0]) {
+		case 'E': {
+			// Sector [E]rase
+			uint32_t address = (__builtin_bswap32(COMMAND_HI) << 8) | (command[4]);
+			spiEraseSector(address);
+			break;
+		}
+
+		case 'P': {
+			// Page [P]rogram
+			if (transferred >= 0x208) {
+				uint32_t address = (__builtin_bswap32(COMMAND_HI) << 8);
+				uint32_t chksum = __builtin_bswap32(COMMAND_LO); // TODO: use it
+
+				spiProgramPage(address, command+8);
+				spiProgramPage(address+0x100, command+0x108);
+
+				if (address == 0) {
+					// re-calculate flashbuf
+					keybuf_ptr = (uint32_t *)seedBuffer;
+
+					// command+8 is ROM header
+					// gamecode is @ 0xC
+					key1_init(*(uint32_t *)(command+8+0xC), blowfish_nds);
+					flash_keybuf(keybuf_nds, (uint8_t *)keybuf_ptr, 0);
+
+					key1_init(*(uint32_t *)(command+8+0xC), blowfish_dsi);
+					flash_keybuf(keybuf_dsi, (uint8_t *)keybuf_ptr, 0);
+				}
+			}
+			break;
+		}
+
+		case 'R': {
+			// Chip erase ([R]eset)
+			spiEraseChip();
+			break;
+		}
+
+		case 'C': {
+			// Update [C]onfig
+			uint32_t offset = (__builtin_bswap32(COMMAND_HI) << 8);
+
+			if (transferred >= 0x1008+0x40) {
+				flash_config(offset, (uint8_t *)(command+8), 1);
+			}
+			break;
+		}
+
+		case 'B': {
+			// Update [B]lowfish table
+
+			if (transferred >= (4*0x412)+8+0x40) {
+				// That's very long. NDS supports it, apparently (2000h bytes transfers)
+				flash_keybuf(keybuf_nds, (uint8_t *)(command+8), 1);
+			}
+
+			break;
+		}
+
+		case 'T': {
+			// Update Blowfish table for [T]WL
+
+			if (transferred >= (4*0x412)+8+0x40) {
+				// That's very long. NDS supports it, apparently (2000h bytes transfers)
+				flash_keybuf(keybuf_dsi, (uint8_t *)(command+8), 1);
+			}
+
+			break;
+		}
+
+		}
+
+		enable_dma_input();
+	}
 }
 
 // This whole flashing protocol is a mess
 static void handle_flash() {
-	WAIT_FOR_BYTE(3)
-	if (memcmp_v(command, flash_pollcmd, 4) == 0) {
-		// not checking the rest of the command for that one
-		DATA_OUT = transferBuffer[0] = 'F';
-		transferBuffer[1] = 'E';
-		transferBuffer[2] = 'U';
-		transferBuffer[3] = 'R';
+	WAIT_FOR_BYTE(0)
 
-	} else if (memcmp_v(command, flash_debugcmd, 4) == 0) {
-		DATA_OUT = transferBuffer[0];
-		//memcpy_v(transferBuffer, flashbuf, 0x200);
+	switch (command[0]) {
+	case 'I': { // Chip ID query (checks if cart is ready)
+		DATA_OUT = transferBuffer[0] = config.chip_id[0];
+		transferBuffer[1] = config.chip_id[1];
+		transferBuffer[2] = config.chip_id[2];
+		transferBuffer[3] = config.chip_id[3];
+		break;
+	}
 
-	} else {
-		// nevermind, we read
-		gpioModeBuffer[7] = 0;
-		*(volatile uint16_t *)&GPIOA->MODER = 0;
+	case 'J': { // Alternate version (no chip id)
+		DATA_OUT = transferBuffer[0] = 'R';
+		transferBuffer[1] = 'D';
+		transferBuffer[2] = 'Y';
+		transferBuffer[3] = '!';
+		break;
+	}
 
-		WAIT_FOR_BYTE(7);
-		if (memcmp_v(command, flash_flashcmd, 8) == 0) {
-			WAIT_FOR_BYTE(8+4+0x100-1);
-			start_ignoring();
+	case 'P':
+	case 'C':
+	case 'B':
+	case 'T': {
+		// Implemented in preinit_flash
+		// Stay in input mode for these commands
+		// (Alternative would be to disable the DMA transfer? TODO)
+		*(volatile uint16_t *)&GPIOA->MODER = gpioModeBuffer[7] = 0;
+		break;
+	}
 
-			// okay, we are free to do whatever we want
-			uint32_t address = __builtin_bswap32(*(volatile uint32_t *)&command[8]);
-			spiProgramPage(address, (command+12)); // NOTE: discarding volatile shouldn't be an issue
-
-			if (address == 0) {
-				// re-calculate flashbuf
-				keybuf_ptr = (uint32_t *)seedBuffer;
-
-				// command+12 is ROM header
-				// gamecode is @ 0xC
-				key1_init(*(uint32_t *)(command+12+0xC));
-
-				// disabled because HAL
-				FLASH_EraseInitTypeDef erase;
-				erase.TypeErase = FLASH_TYPEERASE_PAGES;
-				erase.Banks = FLASH_BANK_1; // i have a single bank
-				erase.Page = (KEYBUF_ADDR - FLASH_BASE) / FLASH_PAGE_SIZE; // erase our page
-				erase.NbPages = (8<<10) / FLASH_PAGE_SIZE; // (erase 8 KB)
-				uint32_t pageerror;
-
-			    HAL_FLASH_Unlock();
-			    HAL_FLASHEx_Erase(&erase, &pageerror);
-			    for (int i = 0; i < 0x412; i += 2) {
-			    	if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, KEYBUF_ADDR + i * 4, *(uint64_t *)&keybuf_ptr[i]) != HAL_OK) {
-			    		DATA_OUT = 0xBF;
-			    		for (;;);
-			    	}
-			    }
-
-			    HAL_FLASH_Lock();
-			}
-			stop_ignoring();
-
-		} else if (memcmp_v(command, flash_erasecmd, 8) == 0) {
-			WAIT_FOR_BYTE(11); // we want command[8,9,10,11]
-			start_ignoring();
-
-			// okay, we are free to do whatever we want
-			uint32_t address = __builtin_bswap32(*(volatile uint32_t *)&command[8]);
-			spiEraseSector(address);
-			stop_ignoring();
-
-		} else {
-			start_ignoring();
-
-			DATA_OUT = 0xEE;
-			delay(500000);
-
-			stop_ignoring();
-		}
+	case 'R':
+	case 'E': {
+		// Reset and erase are in preinit_flash
+		break;
+	}
 	}
 }
 
@@ -1419,7 +1522,7 @@ static void on_spi_select() {
 		address |= DATA_SPI2;
 
 		//volatile uint8_t *buf = spiDataRead(address, 0x200, spi2_sector_backup);
-		const uint8_t *buf = &save[address];
+		const uint8_t *buf = &config.spi_data[address];
 
 		int n = 0;
 		for (;;) {
@@ -1562,13 +1665,13 @@ static void on_chip_unselect() {
 
 		case 6:
 			// flash mode, ignore
-			preinit_flash();
+			preinit_flash(transferred+8);
 			break;
 
 		case 7:
 			// switch to flash mode
 			currentState = 6;
-			preinit_flash();
+			preinit_flash(-1);
 			break;
 		}
 
@@ -1701,9 +1804,11 @@ void ndscart_begin() {
 	EXTI->IMR1 = (1<<14);// | (1<<15); // enable interrupt generation for EXTI14 and EXTI15, disable for EXTI12
 
 #ifdef ENABLE_SPI2
-	EXTI->RTSR1 |= (1<<15);
-	EXTI->FTSR1 |= (1<<15);
-	EXTI->IMR1 |= (1<<15);
+	if (config.spi_variant != 0) {
+		EXTI->RTSR1 |= (1<<15);
+		EXTI->FTSR1 |= (1<<15);
+		EXTI->IMR1 |= (1<<15);
+	}
 #endif
 
 	initKey2Default();
@@ -1721,7 +1826,9 @@ void ndscart_begin() {
 
 #ifdef ENABLE_SPI2
 	// SPI2 init
-	spi2Init();
+	if (config.spi_variant != 0) {
+		spi2Init();
+	}
 #endif
 
 	// Initialize DMA
@@ -1736,9 +1843,7 @@ void ndscart_begin() {
 	NVIC_EnableIRQ(EXTI15_10_IRQn);
 	dmaRestart();
 	spiStop();
-#ifdef ENABLE_SPI2
-	//spi2Prepare();
-#endif
+
 	spiPrepareEnable();
 	DMA1_Channel4->CCR |= DMA_CCR_EN; // CS1 low transfer
 	DMA1_Channel5->CCR |= DMA_CCR_EN; // CS2 low/CS1 high transfer
@@ -1753,7 +1858,9 @@ void ndscart_begin() {
 
 #ifdef ENABLE_SPI2
 	} else if ((idr & CS2_Pin) == 0) {
-		on_spi_select();
+		if (config.spi_variant != 0) {
+			on_spi_select();
+		}
 		spiAbort();
 #endif
 
